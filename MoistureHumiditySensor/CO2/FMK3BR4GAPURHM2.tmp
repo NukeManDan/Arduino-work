@@ -1,0 +1,678 @@
+#include <LCD4Bit.h> 
+#include <stdlib.h>	// for itoa() call
+#include <EEPROM.h>
+
+/* Temperature, Humidity and C02 Environmental controller 
+Written for use in mushroom cultivation. 
+Written by Anthony Pino. anthony_p1234@yahoo.com
+
+Please feel free to use this code chop change etc...
+I take no responsibility for this code blowing up your arduino.
+
+Basically, this program takes in 3 analog inputs, Temperature 1, Temperature 2, C02 and 1 Digital input 
+Humidity. Then switches on/off 4 corresponding digital outputs. 
+Temperature 1 - Thermistor (voltage)
+Temperature 2 - Thermistor (voltage)
+Humidity - Capacitor (frequency change given by a change in capacitance in a 555 timer circuit)
+C02 - Gas sensor (voltage change, amplified using a precision op-amp)
+
+Digital outputs are intended to be connected to high voltage relays to switch heaters
+air pumps and humidifiers etc. Please be carefull when using high voltage.
+
+This code uses the LCD Shield. Normal display shows current readings, Asterixes to the 
+right of the display show if one of the relays is on HIGH.
+Pressing button 1 toggles configure mode, where up down (button 3+4) buttons change the triggering values 
+of the relays. T1,T2,Humidity relays triger when bellow trigger values, C02 relay triggers when above trigger
+value.
+Pressing button 5 scrolls through the trigger values.
+Pressing button 1 again returns to normal display.
+Button 2 not used as mine did not work on the LCD shield, feel free to add it.
+
+Values are kept in EEprom for the last 1.34 days. Pressing Right button when in
+normal mode pushes it to serial tx. Good for plotting on a xls spreadsheet to see what the values 
+were.
+
+*/
+
+
+/* Humidity Calibration
+ Hum     Time between pulses
+ 75%            788.4
+ 100.00%	840
+ y = mx +c , 
+ Where y = Time to between up pulses, x = humidity value
+ */
+#define HUMIDITY_C  680 //668   
+#define HUMIDITY_M 1.6 //1.72	
+
+/* Temperature/Thermistor Calibration
+5v--100k_Therm--input--100k --gnd
+ y = bit value from input, x = Temperature Value
+ y = mx +c    */
+#define TEMPERATURE_M 13.31 
+#define TEMPERATURE_C 188.1 
+
+/* Carbon dioxide calibration 
+ 	y = MLogn(x) + C
+ 	x = e^((y-C)/M)
+
+ 	where y is bit value and x is c02 concentration
+ C02		Bit Value 
+400	279.98
+
+10000	-0.03
+  =-87*(LN(N25))+800
+ */
+#define Carbon_M -83.45 // was-87
+#define Carbon_C 768.62 //was 800
+
+/***********************/
+/* Interval Definitions*/
+#define INTERVAL 30000 //Define ms INTERVAL in between trigerring
+#define SENSOR_INTERVAL 400 // SENSOR INTERVAL 
+#define BACKLIGHT_TIME 180000 // 1 minute for backlight on after no keypress. NOT BEING USED NOW
+#define EE_PROM_INTERVAL 600000 //write data to eeprom every 10minutes
+
+/*******/
+/*Define array size to be used for averaging. */
+/*In The array, the max value and min value are taken out and the rest averaged*/
+/* If 2 or less, it is just averaged*/
+#define ARRAY_SIZE 30 
+
+
+
+/**********************/
+/*Hysterisis Intervals*/
+#define TEMP_LO 1
+#define TEMP_HI 2
+#define HUM_LO 5
+#define HUM_HI 0 //trimmed as tends to overshoot
+#define CO2_LO 200
+#define CO2_HI 100
+
+/**********************/
+/* Define input Pins  */
+//Analog
+#define THERM1  1    // Analog 1 Thermistor 1   voltage
+#define THERM2 2    // Analog 2   Thermistor 2 Voltage
+#define CARBONDI3 3 // Analog 3
+// Digital
+#define HUMIDITY2 2 // Digital 2 Humidity  
+
+/**********************/
+/*Define output  Pins */
+//Digital
+#define LEDPIN  13     // select the pin for the LED
+#define RELAY1  3      // Relay to start the first heater
+#define RELAY2  11      // Relay to start the second heater
+#define RELAY3  12     //Relay to start the humidifier
+#define RELAY4  13     //Relay to start air pump
+#define BACKLIGHT 10   //backlight Pin Value
+//Can use pins 0 + 1 if serial not being used.. or use an analog pin.
+
+/******Define Size of storage array for values*/
+#define ARRAY_STORE 200 //how many lines to store in eeprom. ARRAY_STORE*4 <1k
+
+
+
+/*****************************/
+/*set Triggers *************/
+int heatTrigger1  = 25; 
+int heatTrigger2  = 20; 
+int HumTrigger = 80;   
+int C02Trigger = 800; 
+
+/***************************/
+/* Sensor Value initialize */
+int thermValue1 = 0;  
+int thermValue2 = 0;
+int humValue = 0;
+int carbonDiVal = 0;
+
+int therm1[ARRAY_SIZE];
+int therm2[ARRAY_SIZE];
+int humval[ARRAY_SIZE];
+int carbonD[ARRAY_SIZE];
+
+
+
+/************************/
+/*Set time check ms     */
+long last_check = millis();
+long sensor_check = millis();
+long backlight = millis();
+int timing = millis();
+long time_eeprom = millis();
+
+/**************************/
+/** LCD Shield            */
+LCD4Bit lcd = LCD4Bit(2); // use both lines
+char buf[5]; //used in conversion of int to char for lcd
+
+int configure = 0; //use select as an on/off for configuring
+int showReading = 0; //select which value to modify  0-3
+int adc_key_in = 1024; //Start with -1 key value
+
+int adc_key_val[5] = {
+  100, 160, 360, 770, 800 }; //Analog values from Keys on keypad shield
+
+/*
+int adc_key_val[5] = {
+ 65, 218, 393, 601,1000};
+ */
+int NUM_KEYS = 5;
+int key= -1;
+
+char trigger_names[4][15] = {   
+  "Temp Trigger 1",
+  "Temp Trigger 2",
+  "Humid Trigger",
+  "C02 Trigger" };
+
+/* Set up index value for storing values in eeprom*/
+int k=0;
+
+
+
+void setup()
+{
+  // declare pins as output
+  //pinMode(LEDPIN, OUTPUT);  
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+  pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT);
+
+  //Setup averaging arrays
+  int i;
+
+
+  for(i=0; i< ARRAY_SIZE; i++)
+  {
+    therm1[i] = 512;
+    therm2[i] = 512;
+    humval[i] = 735;
+    carbonD[i] = 645;
+  }
+  //pinMode(BACKLIGHT,OUTPUT); Backlight on all the time, so comment out this.
+
+  lcd.init();
+  lcd.clear();
+  digitalWrite(BACKLIGHT,HIGH);
+  //Start serial comms with computer
+  Serial.begin(115200);
+
+
+
+}
+
+void loop() {
+
+
+  key = get_key(adc_key_in); //In case
+
+  //reset sensor_check if millis() has overflowed
+  if( millis() < sensor_check ){ sensor_check = millis();  }
+
+/* This is for backlight off delay.
+  if ( (millis() < backlight) || millis() > (backlight + BACKLIGHT_TIME))
+  { digitalWrite(BACKLIGHT,LOW); }
+*/
+
+
+  /*Read sensor only after delay of sensor_check*/
+  if(millis() - sensor_check > SENSOR_INTERVAL )
+  {
+    sensor_check = millis();
+
+    int i;
+
+    for (i=0; i < ARRAY_SIZE -1 ; i++) {  
+      therm1[i] = therm1[i+1];
+      therm2[i] = therm2[i+1];
+      humval[i] = humval[i+1];
+      carbonD[i] = carbonD[i+1];
+    }
+
+
+
+    /*** Read in sensor values and change to fit actual temp/hum/ppm values*/
+    therm1[ARRAY_SIZE -1] = analogRead(THERM1);     
+    int temp1 = mov_avg(therm1);
+    thermValue1 = (temp1 - TEMPERATURE_C)/TEMPERATURE_M; // x = (y-c)/m
+
+    therm2[ARRAY_SIZE -1] = analogRead(THERM2);      //thermValue2 = analogRead(THERM2); 
+    int temp2 = mov_avg(therm2);
+    thermValue2 = (temp2- TEMPERATURE_C) /TEMPERATURE_M; 
+
+    int hum_temp = pulseIn(HUMIDITY2,HIGH,2000); //
+    if (hum_temp > 40 )  //Remove some non readings which give huge negative numbers
+    {
+      humval[ARRAY_SIZE -1] = hum_temp;
+      hum_temp = mov_avg(humval);
+      humValue = (hum_temp - HUMIDITY_C)/HUMIDITY_M; // y -c/M = x
+    }
+
+    int c_temp = analogRead(CARBONDI3); 
+    Serial.print(c_temp);
+   /*if (( c_temp > 0 ) && (c_temp <300))      //stops unecessary calcs which grind arduino to a halt
+    {*/
+      carbonD[ARRAY_SIZE -1] = c_temp;
+      c_temp = mov_avg(carbonD);
+      Serial.print(":");
+      Serial.print(c_temp);
+      float c_float = c_temp - Carbon_C; // For ease of use in power function
+      c_float = c_float/Carbon_M;	
+      Serial.print(":");
+      Serial.print(c_float);
+      carbonDiVal  = pow(2.718,c_float);
+    //}
+    Serial.print(":");
+    Serial.println(carbonDiVal);
+
+    /**Add first line of Display**/
+    if (configure == 0)
+    {
+      lcd.cursorTo(1,0);
+      lcd.printIn("T1 T2 Hu CO2");	  
+    }
+    /**** Add second line of the Display *****/
+    if (configure == 0)
+    {
+      lcd.cursorTo(2,0); 
+      itoa(thermValue1, buf, 10);
+      lcd.printIn(buf);
+
+      lcd.cursorTo(2,3);
+      itoa(thermValue2, buf, 10);
+      lcd.printIn(buf);
+
+      lcd.cursorTo(2,8);
+      lcd.printIn(" ");
+      lcd.cursorTo(2,6);
+      itoa(humValue, buf, 10);
+      lcd.printIn(buf);
+
+      lcd.cursorTo(2,12);
+      lcd.printIn("  ");
+      lcd.cursorTo(2,9);
+      itoa(carbonDiVal, buf, 10);
+      lcd.printIn(buf);
+    }
+
+
+    /*Print Output Values*/
+    /*
+Serial.print(thermValue1);
+     Serial.print(":");
+     Serial.print(thermValue2);
+     Serial.print(":");
+     Serial.print(hum_temp); //usually humValue
+     Serial.print(":");
+     Serial.print(carbonDiVal);
+     Serial.println(":");
+     */
+    /* PRINT ARRAYS THAT ARE AVERAGED
+     Serial.print("**Therm1*");
+     Serial.print(thermValue1);
+     Serial.print("*(");
+     for( i=0; i<ARRAY_SIZE; i++)
+     {
+     Serial.print(therm1[i]);
+     Serial.print(":");
+     }
+     Serial.print(")**Therm2*");
+     Serial.print(thermValue2);
+     Serial.print("*(");
+     for( i=0; i<ARRAY_SIZE; i++)
+     {
+     Serial.print(therm2[i]);
+     Serial.print(":");
+     }    
+     Serial.print(")**Humid*");
+     Serial.print(humValue);
+     Serial.print("*(");
+     for( i=0; i<ARRAY_SIZE; i++)
+     {
+     Serial.print(humval[i]);
+     Serial.print(":");      
+     }
+     Serial.print(")**carbonD*");
+     Serial.print(carbonDiVal);
+     Serial.print("*(");
+     for( i=0; i<ARRAY_SIZE; i++)
+     {
+     Serial.print(carbonD[i]);
+     Serial.print(":");      
+     }
+     Serial.println(")");
+     */
+
+  }
+
+  /********************************************/
+  /*EEPROM STORAGE CODE   *********************/
+  if(millis() < time_eeprom) { time_eeprom = millis(); }
+  /**Put values into eeprom*/
+  if(millis() - time_eeprom > EE_PROM_INTERVAL)
+  {
+    time_eeprom = millis();
+    EEPROM.write((k*4),(thermValue1));
+    EEPROM.write((k*4+1),(thermValue2));
+    EEPROM.write((k*4+2),(humValue));
+    EEPROM.write((k*4+3),(carbonDiVal/10));
+    k=k+1;
+    if(k>=ARRAY_STORE) { k=0;  }
+  }
+ /**********************************************/
+
+
+/*******************************************************/
+/*RELAY Changes and value checks, after time INTERVAL***/
+  if( millis() < last_check ) { last_check = millis(); }
+
+  if (millis() - last_check > INTERVAL) 
+  {
+    last_check = millis(); //left out until final test, no wait 30sec
+
+//Temperature 1 check and Relay Change
+    lcd.cursorTo(1,14);
+    if (thermValue1 > (heatTrigger1 +TEMP_HI) ) {
+      digitalWrite(RELAY1, LOW);
+      lcd.printIn(" ");  }
+
+    if (thermValue1 < (heatTrigger1 -TEMP_LO) ) {
+      digitalWrite(RELAY1, HIGH); 
+      lcd.printIn("*"); }
+
+//Temperature 2 and Relay Change
+    lcd.cursorTo(1,15); 
+    if (thermValue2 > (heatTrigger2 +TEMP_HI) ) {
+      digitalWrite(RELAY2, LOW);
+      lcd.printIn(" ");}
+
+    if (thermValue2 < (heatTrigger2 -TEMP_LO) ) {
+      digitalWrite(RELAY2, HIGH); 
+      lcd.printIn("*"); }	
+
+//Carbon Dioxide check and Relay Change
+    lcd.cursorTo(2,15);
+    if ( carbonDiVal < C02Trigger- CO2_LO  ) {
+      digitalWrite(RELAY4, LOW);
+      lcd.printIn(" ");  }
+    if ( carbonDiVal > C02Trigger+ CO2_HI  ) {
+      digitalWrite(RELAY4, HIGH); 
+      lcd.printIn("*");  }		
+
+//Humidity Check and Relay change
+    lcd.cursorTo(2,14);    
+    if ( (humValue > HumTrigger+ HUM_HI ) || (humValue == -HUMIDITY_C)) {
+      digitalWrite(RELAY3, LOW);
+      lcd.printIn(" "); }
+    if ( (humValue <= HumTrigger - HUM_LO ) && (humValue != -HUMIDITY_C)) {
+      digitalWrite(RELAY3, HIGH); 
+      lcd.printIn("*");}	
+}   
+
+/***************************/
+/*KEYPAD CODE***************/
+  adc_key_in = analogRead(0);
+  key = get_key(adc_key_in); //convert into key press. key = 1-5. -1 for none
+
+  if ( (key != -1))
+  {
+  /*  digitalWrite(BACKLIGHT,HIGH); //Backlight code taken out
+    backlight = millis();*/
+
+    if (configure ==1)
+    { lcd.clear();  } 
+    delay(20); //debounce
+    key = get_key(adc_key_in);
+    delay(200);
+
+    /****Select key****/
+    if ( key == 3 ) //Toggle the configure Key
+    {
+      lcd.clear();  
+      if( configure == 1)
+      { 
+        configure = 0;
+        lcd.clear();
+        delay(100);
+
+      }
+      else if ( configure == 0 )
+      {
+        configure = 1;  
+        lcd.clear(); 
+        delay(100);
+      }
+      key = -1;
+    }
+  }
+
+  /***** Up Key Press ******/
+  if ( (key == 1) && ( configure == 1 ) )
+  {
+    lcd.cursorTo(2,0);
+
+    switch(showReading)
+    {
+    case 0: //heatTrigger1
+      heatTrigger1 = heatTrigger1 +1;
+      itoa(heatTrigger1, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 1: //heatTrigger2
+      heatTrigger2 = heatTrigger2 +1;
+      itoa(heatTrigger2, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 2:
+      HumTrigger = HumTrigger +5;
+      itoa(HumTrigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 3:
+      C02Trigger = C02Trigger + 100;
+      itoa(C02Trigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    }
+  }
+
+  /**** Keypress down ****/
+  if ( (key == 2) && ( configure == 1 ))
+  {
+    lcd.cursorTo(2,0); 
+
+    switch(showReading)
+    {
+    case 0: //heatTrigger1
+      heatTrigger1 = heatTrigger1 -1;
+      itoa(heatTrigger1, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 1: //heatTrigger2
+      heatTrigger2 = heatTrigger2 -1;
+      itoa(heatTrigger2, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 2:
+      HumTrigger = HumTrigger -5;
+      itoa(HumTrigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 3:
+      C02Trigger = C02Trigger - 100;
+      itoa(C02Trigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    }
+
+  }
+
+  /***** Keypress Right ****/
+
+  if ( (key == 0) && (configure ==1) )
+  {
+    lcd.cursorTo(2,0); //line 2 x =0
+
+      switch(showReading)
+    {
+    case 0: //heatTrigger1 to c02
+      showReading = 1;
+      itoa(heatTrigger2, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 1: //heatTrigger2 to HumTrigger
+      showReading = 2;
+      itoa(HumTrigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 2: //HumTrigger to C02Trigger
+      showReading = 3;
+      itoa(C02Trigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 3: // C02Trigger to heatTrigger1
+      showReading = 0;
+      itoa(heatTrigger1, buf, 10);
+      lcd.printIn(buf);
+      break;
+    }
+  }
+  /******Dump to serial all EEPROM values if keypress right no config***/
+  if ( (key == 0) && (configure ==0) )
+  {
+    lcd.cursorTo(1,0);
+    lcd.printIn("Upload");
+    char buf2[10];
+    lcd.cursorTo(2,0);
+    lcd.printIn("               "); 
+
+    lcd.cursorTo(2,10);
+    lcd.cursorTo(2,0);
+
+
+    Serial.println("");
+    Serial.print("Values end at:");
+    Serial.println(k+1);
+    for( k=0; k <=ARRAY_STORE; k++) //l=l+4
+    {
+      Serial.print(int(EEPROM.read(k*4)));
+      Serial.print(",");
+      Serial.print(int(EEPROM.read(k*4+1)));
+      Serial.print(",");
+      Serial.print(int(EEPROM.read(k*4+2)));
+      Serial.print(",");
+      Serial.println(int(EEPROM.read(k*4+3))); 
+    } 
+  }
+
+
+  /***** Add the first line of the display******/
+  lcd.cursorTo(1,0); //line 1 x =0
+
+    if (configure == 1)
+  {
+    lcd.printIn(trigger_names[showReading]);
+
+    lcd.cursorTo(2,0);
+    switch(showReading)
+    {
+    case 0: 
+      itoa(heatTrigger1, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 1: 
+      itoa(heatTrigger2, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 2:
+      itoa(HumTrigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    case 3:
+      itoa(C02Trigger, buf, 10);
+      lcd.printIn(buf);
+      break;
+    }
+  }
+
+} //End Main loop
+
+int get_key(unsigned int input)
+{
+  int k;
+
+  for ( k=0; k < NUM_KEYS; k++)
+  {
+    if (input < adc_key_val[k] )
+    { 
+      return k; 
+    }
+  }
+
+  if ( k >= NUM_KEYS)
+  {
+    k = -1;
+  }
+  return k;
+}
+
+int mov_avg(int averages[ARRAY_SIZE])
+{
+  int summation = averages[0];
+  int i=1;
+  for( i=1; i < ARRAY_SIZE; i++)
+  {
+    summation = averages[i] + summation;
+  }
+  if(ARRAY_SIZE >2)
+  {
+    summation = summation - max_array(averages) - min_array(averages);
+    summation = summation/(ARRAY_SIZE -2);
+  }
+  else
+  {
+    summation = summation/ARRAY_SIZE;
+  }
+  return summation;
+}
+
+
+int max_array(int array[ARRAY_SIZE])
+{
+  int i=0;
+  int current= array[0];
+  for( i=1; i<ARRAY_SIZE; i++)
+  {
+    if (array[i] > current)
+    {
+      current = array[i];
+    }
+  }
+  return current;
+}
+
+int min_array(int array[ARRAY_SIZE])
+{
+  int i=0;
+  int current= array[0];
+  for( i=1; i<ARRAY_SIZE; i++)
+  {
+    if (array[i] < current)
+    {
+      current = array[i];
+    }
+  }
+  return current;
+}
+
+
+
+
+
+
+
